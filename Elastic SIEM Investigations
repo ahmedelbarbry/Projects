@@ -1,0 +1,187 @@
+# Elastic-based Incident Report and Hunting Playbook
+
+Project: DNS-to-Execution investigation (single-file README only)
+
+# One-line summary
+
+Paste-ready Elastic/KQL queries and a reproducible IR workflow that trace DNS -> download -> OneNote -> batch -> PowerShell -> C2 -> lateral movement. Everything needed to run the hunt, pivot, and act is in this file. built while completing the HTB SOC Analyst job path.
+
+# TL;DR for a hiring manager
+
+Clear, focused log-driven investigation that links a user download to code execution, C2, and AD reconnaissance. Queries are ready to paste into Kibana, pivots are explicit, and remediation steps are prioritized. This shows the author can produce usable detection, triage, and containment artifacts an analyst can act on immediately.
+
+# What is included
+
+* Exact KQL queries used at each step of the investigation.
+* Pivot queries and how to move from DNS to process creation to network activity to authentication artifacts.
+* Triage and containment playbook with prioritized actions.
+* Suggested Elastic detection rules to add based on this hunt.
+* MITRE ATT\&CK mapping, validation notes, and honest limitations.
+
+---
+
+# Paste-ready KQL and investigative steps
+
+1. Filter DNS questions from source IP, excluding noisy Google domains
+source.ip:192.168.28.130 AND dns.question.name:* 
+AND NOT dns.question.name:*.google.com 
+AND NOT dns.question.name:*.google-analytics.com
+
+
+
+2. Display only dns.question.name in the results table
+* Use Kibana columns: add dns.question.name and set the time picker to the focus window.
+
+3. Find DNS answers for file.io queries and pull resolved IPs
+source.ip:192.168.28.130 AND dns.question.name:"file.io"
+Fields to inspect: dns.answers.data, dns.resolved\_ip, zeek.dns.answers
+Expected resolved IPs seen in the logs: 34.197.10.85 and 3.213.216.16
+
+4. Confirm network connections to returned IPs in the same timeframe
+source.ip:192.168.28.130 AND destination.ip:34.197.10.85 
+AND destination.port:443 
+Expected result: connections that corroborate an HTTPS download.
+
+5. Detect process creation referencing invoice.one
+event.code:1 AND process.command_line:*invoice.one*
+Note: expand time range to ensure you capture the process creation event. Expected event on host WS001 showing OneNote opening the file.
+
+6. Find processes spawned by OneNote
+event.code:1 AND process.parent.name:"ONENOTE.EXE"
+Look for cmd.exe and OneNoteM.exe. cmd.exe spawning invoice.bat is a critical signal.
+
+7. Trace invoice.bat child activity
+event.code:1 AND process.parent.command_line:*invoice.bat*
+Expected result: PowerShell spawn that downloads and executes content from Pastebin.
+
+8. Identify PowerShell execution that fetched from Pastebin
+event.code:1 AND process.name:"powershell.exe" AND process.command_line:*pastebin.com
+
+Pivot to process ID
+process.pid:9944 AND process.name:"powershell.exe"
+Use process.pid to pull all related events: file writes, DNS queries, network connections.
+
+9. Check DNS and network activity for ngrok / C2
+   DNS query for ngrok domains:
+dns.question.name:*ngrok.io* AND source.ip:192.168.28.130
+
+Network connection to resolved C2 IP example:
+source.ip:192.168.28.130 AND destination.ip:18.158.249.75 AND destination.port:443
+Repeated TLS connections to the same destination indicate encrypted C2.
+
+10. Find dropped and executed artifacts by name or hash
+    By name:
+process.name:"default.exe" OR process.name:"svchost.exe" OR process.name:"SharpHound.exe"
+By hash (example):
+process.hash.sha256:018d37cbd3878258c29db3bc3f2988b6ae688843801b9abc28e6151141ab66d4
+Expected findings: same hash on WS001 and PKI, parent PSEXESVC on PKI.
+
+11. Confirm SharpHound execution and arguments
+process.name:"SharpHound.exe" AND process.command_line:*collection_method=all*
+Finding SharpHound with full collection arguments is strong evidence of AD enumeration.
+
+12. Check authentication events tied to source and suspect accounts
+(event.code:4624 OR event.code:4625) 
+AND winlog.event_data.LogonType:3 
+AND source.ip:192.168.28.130
+Look for failed administrator attempts followed by successful svc-sql1 logons on PKI and PAW.
+
+13. Search for parent-child chains originating from the batch file or OneNote
+event.code:1 AND process.parent.command_line:*invoice.bat*
+Then cross-reference with subsequent network and process events for comprehensive timeline.
+
+14. Broad IOC hunt for the suspect hash across the environment
+process.hash.sha256:018d37cbd3878258c29db3bc3f2988b6ae688843801b9abc28e6151141ab66d4
+
+Use this to find additional compromised hosts and lateral execution points.
+
+---
+
+# Narrative reconstruction (evidence-based)
+
+1. DNS queries from 192.168.28.130 resolve file.io and return IPs 34.197.10.85 and 3.213.216.16.
+2. Host WS001 connects to 34.197.10.85:443 within the same minute, consistent with a download.
+3. The downloaded item invoice.one is opened by OneNote. OneNote spawns cmd.exe which runs invoice.bat. invoice.bat spawns PowerShell that fetches a script from Pastebin. PowerShell process PID is 9944.
+4. PowerShell writes files and resolves ngrok domains, then makes repeated TLS connections to C2 IPs such as 18.158.249.75 and 3.125.102.39.
+5. default.exe is dropped and executed, dropping svchost.exe and SharpHound.exe. SharpHound runs with collection arguments.
+6. The same default.exe hash appears on PKI and other hosts. On PKI it was executed by PSEXESVC, indicating remote execution and likely lateral movement. svc-sql1 shows suspicious successful logons on multiple hosts.
+7. Conclusion: user download led to execution, C2 establishment, and AD reconnaissance activity. The next steps are containment, evidence collection, and environment-wide hunting for the suspect hash and related IOCs.
+
+Caveat: this reconstruction is log-driven. EDR, disk images, and memory captures are required to confirm persistence mechanisms and full scope.
+
+---
+
+
+# Immediate triage and containment playbook (prioritized)
+
+High priority (within 1 hour)
+
+1. Isolate WS001 and PKI from the network or place them in a containment VLAN. If isolation is not possible, block outbound connections to confirmed C2 IPs such as 18.158.249.75 and 3.125.102.39 at firewall/proxy.
+2. From EDR: collect process tree and memory for process.pid 9944, and for each running instance of default.exe. Preserve evidence and capture volatile data.
+3. Quarantine artifacts default.exe, svchost.exe, payload.exe. Extract SHA256 and compare to threat intel.
+4. Reset credentials for svc-sql1 and any accounts showing unusual logon patterns. Force rotation for service accounts where possible and escalate MFA for administrative users.
+
+Medium priority (same day)
+5\. Hunt for process.hash across the environment. Identify all hosts with the hash and note parent processes.
+6\. Search for PSEXESVC parent activity across domain hosts to identify lateral execution and compromised admin credentials.
+7\. Audit AD for suspicious permission changes, delegation settings, and replication requests.
+
+Longer term
+8\. Run a full AD ACL audit and limit unnecessary privileges.
+9\. Harden endpoint controls to prevent script-based downloads from OneNote or blocked child processes spawned by Office apps.
+10\. Implement detections listed below and tune for false positives.
+
+---
+
+# Suggested Elastic detection rules (KQL) to add
+
+1. OneNote spawning cmd.exe
+event.code:1 AND process.parent.name:"ONENOTE.EXE" AND process.name:"cmd.exe"
+
+2. PowerShell downloads from paste sites
+event.code:1 AND process.name:"powershell.exe" 
+AND process.command_line:(*pastebin.com* OR *hastebin* OR *gist.github.com*)
+
+3. ngrok DNS followed by TLS connection
+dns.question.name:*.ngrok.io AND destination.port:443
+
+4. Suspect binary hash propagation
+process.hash.sha256:018d37cbd3878258c29db3bc3f2988b6ae688843801b9abc28e6151141ab66d4
+
+5. PSEXESVC spawning unexpected executables
+event.code:1 AND process.parent.name:"PSEXESVC.exe" AND NOT process.name:("expected-service.exe" OR "expected-agent.exe")
+
+Add these as Elastic rule objects, run in alerting mode to test against historical data, then enable with appropriate lookups and suppressions.
+
+---
+
+# MITRE ATT\&CK mapping (concise)
+
+* Initial Access: User execution (TA0001)
+* Execution: PowerShell (T1059.001)
+* Lateral Movement: PsExec (T1021.002)
+* Discovery: AD enumeration via SharpHound (T1087, T1082)
+* Command and Control: ngrok / HTTPS (T1095 / T1071.001)
+* Credential Access: Password brute forcing or credential theft implied (T1003)
+* Exfiltration: Encrypted channel to C2 (T1041)
+
+---
+
+# Validation notes and assumptions
+
+* This is a log-driven investigation. EDR disk, memory, and file artifacts will confirm persistence and payload behavior.
+* DNS answers and network logs support the download and C2 connections. Encrypted TLS streams require packet captures or TLS metadata to examine content.
+* SharpHound execution implies AD reconnaissance but does not by itself prove credential theft. Look for subsequent privileged actions.
+
+# Limitations
+
+* Relies on fields being present and normalized: dns.question.name, dns.answers.data, process.command\_line, process.hash.sha256, winlog fields, and network fields. Map or alias fields if your environment uses different names.
+* Thresholds and detection rules will require tuning to avoid false positives. Test in staging for 48-72 hours before production enablement.
+
+# Skills demonstrated
+
+* Elastic KQL authoring and pivoting from network to host telemetry.
+* Windows event and Sysmon/process telemetry expertise.
+* Cross-data correlation: DNS, network connections, process creation, and authentication events.
+* Incident triage, containment prioritization, and practical detection rule design.
+* Dashboard design for analyst workflows.
