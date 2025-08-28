@@ -1,0 +1,229 @@
+# Splunk-based SOC Detections
+
+**One-line summary**
+A compact, production-minded collection of Splunk searches and triage guidance that surface high-value threats: reconnaissance, credential attacks, lateral movement, C2 and beaconing, exfiltration, and ransomware-style behavior.built while completing the HTB SOC Analyst job path.
+
+## Why this matters
+
+These searches were written to deliver signal, not noise. They are focused on clear triage pivots, sensible thresholds, and basic enrichment so a junior analyst can validate and escalate with confidence. Readable SPL, realistic thresholds, and immediate next steps for analysts are the priorities. If you want a candidate who writes useful detections and thinks like an analyst, these searches demonstrate that skill.
+
+## What is included in this file
+
+* All Splunk searches used for detection, paste-ready.
+* Short triage playbook that applies to these detections.
+* Validation notes and deployment caveats.
+
+## All SPLs (paste-ready)
+
+Password spraying (authentication failures, 15 minute buckets)
+index=main source="WinEventLog:Security" EventCode=4625
+| bin span=15m _time
+| stats values(user) as Users, dc(user) as dc_user by src, Source_Network_Address, dest, EventCode, Failure_Reason
+| where dc_user > 5
+
+Responder-like attacks
+index=main earliest=1690290814 latest=1690291207 EventCode IN (4648) 
+| table _time, EventCode, source, name, user, Target_Server_Name, Message
+| sort 0 _time
+
+Kerberoasting / AS-REP Roasting
+index=main earliest=1690450374 latest=1690450483 EventCode=4648 OR (EventCode=4769 AND service_name=iis_svc)
+| dedup RecordNumber
+| rex field=user "(?<username>[^@]+)"
+| bin span=2m _time 
+| search username!=*$ 
+| stats values(EventCode) as Events, values(service_name) as service_name, values(Additional_Information) as Additional_Information, values(Target_Server_Name) as Target_Server_Name by _time, username
+| where !match(Events,"4648")
+
+Kerberos preauth / TGT observation block
+index=main earliest=1690392745 latest=1690393283 source="WinEventLog:Security" EventCode=4768 Pre_Authentication_Type=0
+| rex field=src_ip "(\:\:ffff\:)?(?<src_ip>[0-9\.]+)"
+| table _time, src_ip, user, Pre_Authentication_Type, Ticket_Options, Ticket_Encryption_Type
+
+Pass-the-Hash detection
+index=main earliest=1690450708 latest=1690451116 source="WinEventLog:Security" EventCode=4624 Logon_Type=9 Logon_Process=seclogo
+| table _time, ComputerName, EventCode, user, Network_Account_Domain, Network_Account_Name, Logon_Type, Logon_Process
+
+Pass-the-Ticket detection
+index=main earliest=1690392405 latest=1690451745 source="WinEventLog:Security" user!=*$ EventCode IN (4768,4769,4770) 
+| rex field=user "(?<username>[^@]+)"
+| rex field=src_ip "(\:\:ffff\:)?(?<src_ip_4>[0-9\.]+)"
+| transaction username, src_ip_4 maxspan=10h keepevicted=true startswith=(EventCode=4768)
+| where closed_txn=0
+| search NOT user="*$@*"
+| table _time, ComputerName, username, src_ip_4, service_name, category
+
+Overpass-the-Hash detection
+index=main earliest=1690443407 latest=1690443544 source="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" (EventCode=3 dest_port=88 Image!=*lsass.exe) OR EventCode=1
+| eventstats values(process) as process by process_id
+| where EventCode=3
+| stats count by _time, Computer, dest_ip, dest_port, Image, process
+| fields - count
+
+Golden Ticket detection (Kerberos transaction-based)
+index=main earliest=1690451977 latest=1690452262 source="WinEventLog:Security" user!=*$ EventCode IN (4768,4769,4770) 
+| rex field=user "(?<username>[^@]+)"
+| rex field=src_ip "(\:\:ffff\:)?(?<src_ip_4>[0-9\.]+)"
+| transaction username, src_ip_4 maxspan=10h keepevicted=true startswith=(EventCode=4768)
+| where closed_txn=0
+| search NOT user="*$@*"
+| table _time, ComputerName, username, src_ip_4, service_name, category
+
+Silver Ticket detection
+index=main latest=1690545656 EventCode=4624
+| stats min(_time) as firstTime, values(ComputerName) as ComputerName, values(EventCode) as EventCode by user
+| eval last24h = 1690451977
+| where firstTime > last24h
+
+Alternative Silver Ticket time calc
+| eval last24h=relative_time(now(),"-24h@h")
+| convert ctime(firstTime)
+| convert ctime(last24h)
+| lookup users.csv user as user OUTPUT EventCode as Events
+| where isnull(Events)
+
+Unconstrained Delegation detection
+index=main earliest=1690544538 latest=1690544540 source="WinEventLog:Microsoft-Windows-PowerShell/Operational" EventCode=4104 Message="*TrustedForDelegation*" OR Message="*userAccountControl:1.2.840.113556.1.4.803:=524288*" 
+| table _time, ComputerName, EventCode, Message
+
+Constrained Delegation detection (Kerberos over port 88)
+index=main earliest=1690562367 latest=1690562556 source="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational" 
+| eventstats values(process) as process by process_id
+| where EventCode=3 AND dest_port=88
+| table _time, Computer, dest_ip, dest_port, Image, process
+
+DCSync detection
+index=main earliest=1690544278 latest=1690544280 EventCode=4662 Message="*Replicating Directory Changes*"
+| rex field=Message "(?P<property>Replicating Directory Changes.*)"
+| table _time, user, object_file_name, Object_Server, property
+
+DCShadow detection
+index=main earliest=1690623888 latest=1690623890 EventCode=4742 
+| rex field=Message "(?P<gcspn>XX\/[a-zA-Z0-9\.\-\/]+)" 
+| table _time, ComputerName, Security_ID, Account_Name, user, gcspn 
+| search gcspn=*
+
+RDP brute-force (bro/rdp JSON sourcetype)
+index="rdp_bruteforce" sourcetype="bro:rdp:json"
+| bin _time span=5m
+| stats count values(cookie) by _time, id.orig_h, id.resp_h
+| where count>30
+
+Beaconing Malware detection (periodicity)
+index="cobaltstrike_beacon" sourcetype="bro:http:json" 
+| sort 0 _time
+| streamstats current=f last(_time) as prevtime by src, dest, dest_port
+| eval timedelta = _time - prevtime
+| eventstats avg(timedelta) as avg, count as total by src, dest, dest_port
+| eval upper=avg*1.1
+| eval lower=avg*0.9
+| where timedelta > lower AND timedelta < upper
+| stats count, values(avg) as TimeInterval by src, dest, dest_port, total
+| eval prcnt = (count/total)*100
+| where prcnt > 90 AND total > 10
+
+Nmap port scanning detection
+index="cobaltstrike_beacon" sourcetype="bro:conn:json" orig_bytes=0 dest_ip IN (192.168.0.0/16, 172.16.0.0/12, 10.0.0.0/8) 
+| bin span=5m _time 
+| stats dc(dest_port) as num_dest_port by _time, src_ip, dest_ip 
+| where num_dest_port >= 3
+
+Kerberos brute force detection
+index="kerberos_bruteforce" sourcetype="bro:kerberos:json"
+error_msg!=KDC_ERR_PREAUTH_REQUIRED
+success="false" request_type=AS
+| bin _time span=5m
+| stats count dc(client) as "Unique users" values(error_msg) as "Error messages" by _time, id.orig_h, id.resp_h
+| where count>30
+
+Kerberoasting detection (network/kerberos sourcetype)
+index="sharphound" sourcetype="bro:kerberos:json"
+request_type=TGS cipher="rc4-hmac" 
+forwardable="true" renewable="true"
+| table _time, id.orig_h, id.resp_h, request_type, cipher, forwardable, renewable, client, service
+
+Golden Tickets (kerberos network sourcetype)
+index="golden_ticket_attack" sourcetype="bro:kerberos:json"
+| where client!="-"
+| bin _time span=1m 
+| stats values(client), values(request_type) as request_types, dc(request_type) as unique_request_types by _time, id.orig_h, id.resp_h
+| where request_types=="TGS" AND unique_request_types==1
+
+Cobalt Strike PSExec style SMB file open detection
+index="cobalt_strike_psexec"
+sourcetype="bro:smb_files:json"
+action="SMB::FILE_OPEN" 
+name IN ("*.exe", "*.dll", "*.bat")
+path IN ("*\\c$", "*\\ADMIN$")
+size>0
+
+Zerologon detection (netlogon dce rpc)
+index="zerologon" endpoint="netlogon" sourcetype="bro:dce_rpc:json"
+| bin _time span=1m
+| where operation == "NetrServerReqChallenge" OR operation == "NetrServerAuthenticate3" OR operation == "NetrServerPasswordSet2"
+| stats count values(operation) as operation_values dc(operation) as unique_operations by _time, id.orig_h, id.resp_h
+| where unique_operations >= 2 AND count>100
+
+Exfiltration via HTTP
+index="cobaltstrike_exfiltration_http" sourcetype="bro:http:json" method=POST
+| stats sum(request_body_len) as TotalBytes by src, dest, dest_port
+| eval TotalBytes = TotalBytes/1024/1024
+
+Exfiltration via DNS
+index=dns_exf sourcetype="bro:dns:json"
+| eval len_query=len(query)
+| search len_query>=40 AND query!="*.ip6.arpa*" AND query!="*amazonaws.com*" AND query!="*._googlecast.*" AND query!="_ldap.*"
+| bin _time span=24h
+| stats count(query) as req_by_day by _time, id.orig_h, id.resp_h
+| where req_by_day>60
+| table _time, id.orig_h, id.resp_h, req_by_day
+
+Ransomware open + rename behavior detection
+index="ransomware_open_rename_sodinokibi" sourcetype="bro:smb_files:json" 
+| where action IN ("SMB::FILE_OPEN", "SMB::FILE_RENAME")
+| bin _time span=5m
+| stats count by _time, source, action
+| where count>30 
+| stats sum(count) as count values(action) dc(action) as uniq_actions by _time, source
+| where uniq_actions==2 AND count>100
+
+Recon / CallTrace anomaly snippet (example of how to filter noisy CallTrace)
+index="main" CallTrace="*UNKNOWN*" SourceImage!="*Microsoft.NET*" CallTrace!=*ni.dll* CallTrace!=*clr.dll* CallTrace!=*wow64* SourceImage!="C:\\Windows\\Explorer.EXE" 
+| where SourceImage!=TargetImage 
+| stats count by SourceImage, TargetImage, CallTrace
+
+
+
+## Short triage playbook (starter, applies to most detections)
+
+1. Confirm the signal
+   * Inspect raw events for process image, parent process, source IP, destination host, timestamps, and user context.
+   * Check event counts and whether the signal matches expected periodicity or threshold triggers.
+2. Enrich quickly
+   * DNS lookup, WHOIS, IP reputation, recent authentication history for the account, recent process lists from EDR, asset tags and owner.
+3. Decide containment or escalation
+   * Isolate host for evidence preservation if active credential dumping, suspicious parent-child process chain, or unauthorized lateral tools are present.
+   * Reset or rotate credentials if DCsync or replication events are confirmed.
+   * Block confirmed C2 endpoints on perimeter only after enrichment and cross-correlation.
+4. Document and close with a ticket including pivot queries and evidence. Each detection above should be followed by these steps. Use whitelists and lookups to reduce future false positives.
+
+---
+
+## Validation notes
+
+* Detection logic was validated against synthetic traffic and curated test artifacts. Thresholds were iterated to reduce expected false positives.
+* Host detections assume Sysmon-like or standard Windows event fields. Network detections assume Zeek/IDS-style fields in Splunk sourcetypes. Field normalization may be required.
+* Each detection contains obvious knobs to tune thresholds, minimum counts, and whitelist lookups for production use.
+
+
+## Skills demonstrated
+
+* Splunk SPL authoring and saved search construction
+* Detection engineering and threshold tuning
+* Windows telemetry: EventID, Sysmon, Kerberos flows, Netlogon anomaly detection
+* Network telemetry analysis for beaconing, scanning, and exfiltration
+* Writing analyst-friendly triage steps and pivot queries
+
+## Quick note for a reviewer
+
+* This file contains all searches. To test, paste a search into the Splunk search bar, adjust index and time range, and run in preview mode.
